@@ -530,6 +530,8 @@ _TELEGRAM_MENU_PRIORITY = (
     "help",
     "new",
     "stop",
+    # Novara pipeline: start the next backlog issue from chat.
+    "pull",
     "status",
     "resume",
     "sessions",

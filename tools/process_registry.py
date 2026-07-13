@@ -544,6 +544,15 @@ class ProcessRegistry:
             started_at=time.time(),
         )
 
+        # Webhook-scoped OS sandbox (see tools/sandbox_wrapper.py). Applied to
+        # both PTY and background spawns so webhook worker sessions cannot
+        # escape the boundary via background processes.
+        try:
+            from tools.sandbox_wrapper import sandbox_prefix
+        except Exception:
+            sandbox_prefix = lambda: []  # noqa: E731
+        _sandbox_argv = sandbox_prefix()
+
         if use_pty:
             # Try PTY mode for interactive CLI tools
             try:
@@ -555,7 +564,7 @@ class ProcessRegistry:
                 pty_env = _sanitize_subprocess_env(os.environ, env_vars)
                 pty_env["PYTHONUNBUFFERED"] = "1"
                 pty_proc = _PtyProcessCls.spawn(
-                    [user_shell, "-lic", f"set +m; {command}"],
+                    _sandbox_argv + [user_shell, "-lic", f"set +m; {command}"],
                     cwd=session.cwd,
                     env=pty_env,
                     dimensions=(30, 120),
@@ -598,7 +607,7 @@ class ProcessRegistry:
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
 
         proc = subprocess.Popen(
-            [user_shell, "-lic", f"set +m; {command}"],
+            _sandbox_argv + [user_shell, "-lic", f"set +m; {command}"],
             text=True,
             cwd=session.cwd,
             env=bg_env,

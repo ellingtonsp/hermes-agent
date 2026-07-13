@@ -561,6 +561,15 @@ class LocalEnvironment(BaseEnvironment):
             if init_files:
                 cmd_string = _prepend_shell_init(cmd_string, init_files)
         args = [bash, "-l", "-c", cmd_string] if login else [bash, "-c", cmd_string]
+        # Webhook-scoped OS sandbox (see tools/sandbox_wrapper.py). Raises
+        # rather than run unsandboxed if a configured wrapper is broken.
+        try:
+            from tools.sandbox_wrapper import sandbox_prefix
+        except Exception:
+            sandbox_prefix = lambda: []  # noqa: E731
+        wrapper = sandbox_prefix()
+        if wrapper:
+            args = wrapper + args
         run_env = _make_run_env(self.env)
 
         # Recover when the cwd has been deleted out from under us — usually by
