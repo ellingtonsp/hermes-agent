@@ -9,6 +9,7 @@ from tools.clarify_tool import (
     check_clarify_requirements,
     MAX_CHOICES,
     CLARIFY_SCHEMA,
+    _flatten_choice,
 )
 
 
@@ -111,46 +112,48 @@ class TestClarifyToolChoicesValidation:
         assert "error" in result
         assert "list" in result["error"].lower()
 
-    def test_choices_must_be_strings(self):
-        """Non-string choices should be rejected with a clear error.
+    def test_dict_choices_are_flattened_not_rejected(self):
+        """Non-string choices should be salvaged via _flatten_choice, not rejected.
 
-        Previously the tool coerced non-string choices with str(), which on
-        dict choices (e.g. {"description": ..., "key": ..., "label": ...})
-        rendered the dict's repr in the user-facing Telegram message and
-        echoed the dict back as the response. The schema (items.type=string)
-        already declares strings only, so reject anything else.
+        LLMs sometimes emit dict-shaped choices (e.g.
+        {"description": ..., "key": ..., "label": ...}) instead of bare
+        strings. The tool unwraps them to their user-facing text at the single
+        platform-agnostic entry point, so the resolved answer is never a raw
+        Python dict repr and the CLI/Telegram/Discord surfaces render clean text.
         """
-        def callback(question: str, choices: Optional[List[str]]) -> str:
-            return "should not reach"
+        captured = {}
 
-        # Dict choices — the original bug
+        def callback(question: str, choices: Optional[List[str]]) -> str:
+            captured["choices"] = choices
+            return choices[0] if choices else "open"
+
+        # Dict choices — label preferred, flattened to text
         result = json.loads(clarify_tool(
             "Pick",
             choices=[{"description": "Pick A", "key": "a", "label": "Pick A"}],  # type: ignore
             callback=callback,
         ))
-        assert "error" in result
-        assert "list of strings" in result["error"]
-        assert "got dict" in result["error"]
-        assert "label" in result["error"]  # points the caller at the fix
+        assert "error" not in result
+        assert captured["choices"] == ["Pick A"]
+        assert result["choices_offered"] == ["Pick A"]
 
-        # Mixed list — should error on first non-string
+        # Mixed list — string kept, dict flattened
         result = json.loads(clarify_tool(
             "Pick",
-            choices=["ok", {"key": "nope"}],  # type: ignore
+            choices=["ok", {"description": "second"}],  # type: ignore
             callback=callback,
         ))
-        assert "error" in result
-        assert "got dict" in result["error"]
+        assert "error" not in result
+        assert captured["choices"] == ["ok", "second"]
 
-        # Int choices — also rejected (schema says strings only)
+        # Int choices — coerced to their string form
         result = json.loads(clarify_tool(
             "Pick",
             choices=[1, 2, 3],  # type: ignore
             callback=callback,
         ))
-        assert "error" in result
-        assert "got int" in result["error"]
+        assert "error" not in result
+        assert captured["choices"] == ["1", "2", "3"]
 
 
 class TestClarifyToolCallbackHandling:
@@ -192,6 +195,70 @@ class TestCheckClarifyRequirements:
     def test_always_returns_true(self):
         """clarify tool has no external requirements."""
         assert check_clarify_requirements() is True
+
+
+class TestClarifyDictChoices:
+    """Dict-shaped choices must be unwrapped to user-facing text at the source.
+
+    LLMs sometimes emit [{"description": "..."}] instead of bare strings. The
+    naive str(c) coercion leaked the Python dict repr onto every surface (CLI
+    panel, Discord buttons, Telegram list) AND returned it verbatim as the
+    user's answer. _flatten_choice normalises at the one platform-agnostic
+    entry point so the whole class is fixed in one place.
+    """
+
+    def test_flatten_unwraps_label_first(self):
+        assert _flatten_choice({"label": "Short", "description": "Long"}) == "Short"
+
+    def test_flatten_unwraps_description_when_no_label(self):
+        assert _flatten_choice({"description": "A loose layout"}) == "A loose layout"
+
+    def test_flatten_unwrap_order_label_over_description(self):
+        assert _flatten_choice({"description": "verbose", "label": "tight"}) == "tight"
+
+    def test_flatten_drops_name_value_only_dict(self):
+        # name/value are component-shaped fields, not user-facing labels —
+        # picking them would leak raw enum values / short model ids.
+        assert _flatten_choice({"name": "tight", "value": "x"}) == ""
+
+    def test_flatten_prefers_canonical_key_over_name(self):
+        assert _flatten_choice({"name": "tight", "description": "Tight desc"}) == "Tight desc"
+
+    def test_flatten_drops_keyless_dict(self):
+        assert _flatten_choice({"foo": "bar", "n": 1}) == ""
+
+    def test_flatten_passthrough_string_and_scalar(self):
+        assert _flatten_choice("plain") == "plain"
+        assert _flatten_choice(7) == "7"
+        assert _flatten_choice(None) == ""
+
+    def test_dict_choices_reach_callback_as_clean_text(self):
+        """The whole point: the UI callback never sees a dict repr."""
+        seen = []
+
+        def cb(question, choices):
+            seen.extend(choices or [])
+            return choices[0]
+
+        result = json.loads(clarify_tool(
+            "Pick a layout",
+            choices=[
+                {"choice": "Tight", "description": "Tight, covers all 3 points"},
+                {"description": "Loose layout"},
+                {"name": "modelid", "value": "abc"},  # dropped, not leaked
+                "A plain string choice",
+            ],
+            callback=cb,
+        ))  # type: ignore
+        assert seen == [
+            "Tight, covers all 3 points",
+            "Loose layout",
+            "A plain string choice",
+        ]
+        # and the resolved answer is clean text, not a dict repr
+        assert result["user_response"] == "Tight, covers all 3 points"
+        assert "{" not in result["user_response"]
+        assert all("{" not in c for c in result["choices_offered"])
 
 
 class TestClarifySchema:
