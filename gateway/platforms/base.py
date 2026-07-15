@@ -24,6 +24,7 @@ from utils import normalize_proxy_url
 
 logger = logging.getLogger(__name__)
 
+
 # Audio file extensions Hermes recognizes for native audio delivery.
 # Kept in sync with tools/send_message_tool.py and cron/scheduler.py via
 # should_send_media_as_audio() below.
@@ -3138,10 +3139,10 @@ class BasePlatformAdapter(ABC):
     ) -> None:
         """
         Continuously send typing indicator until cancelled.
-        
+
         Telegram/Discord typing status expires after ~5 seconds, so we refresh every 2
         to recover quickly after progress messages interrupt it.
-        
+
         Skips send_typing when the chat is in ``_typing_paused`` (e.g. while
         the agent is waiting for dangerous-command approval).  This is critical
         for Slack's Assistant API where ``assistant_threads_setStatus`` disables
@@ -3156,6 +3157,7 @@ class BasePlatformAdapter(ABC):
         one of them succeeds within the 5s platform-side window, the bubble
         stays visible across provider stalls / upstream API timeouts.
         """
+        _keep_tick = 0
         # Bound each send_typing round-trip so the refresh cadence isn't
         # gated on network health.  Must stay below ``interval`` so a slow
         # call gets abandoned before the next scheduled tick.
@@ -3181,6 +3183,7 @@ class BasePlatformAdapter(ABC):
                             "[%s] send_typing error (non-fatal): %s",
                             self.name, typing_err,
                         )
+                _keep_tick += 1
                 if stop_event is None:
                     await asyncio.sleep(interval)
                     continue
@@ -3216,7 +3219,7 @@ class BasePlatformAdapter(ABC):
         chat_id: str,
         typing_task: asyncio.Task | None = None,
         *,
-        timeout: float = 0.5,
+        timeout: float = 2.0,
         stop_attempts: int = 2,
     ) -> None:
         """Stop the refresh task and platform typing state as one operation."""
@@ -3225,7 +3228,7 @@ class BasePlatformAdapter(ABC):
             if typing_task is not None and not typing_task.done():
                 typing_task.cancel()
                 try:
-                    await asyncio.wait_for(asyncio.shield(typing_task), timeout=timeout)
+                    await asyncio.wait_for(typing_task, timeout=timeout)
                 except (asyncio.CancelledError, asyncio.TimeoutError):
                     # The task is cancelled; don't let a slow adapter-specific
                     # cleanup block response delivery or shutdown.

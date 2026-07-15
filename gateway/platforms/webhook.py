@@ -9,6 +9,11 @@ Configuration lives in config.yaml under platforms.webhook.extra.routes.
 Each route defines:
   - events: which event types to accept (header-based filtering)
   - secret: HMAC secret for signature validation (REQUIRED)
+  - pre_process: optional path to a script that transforms the raw JSON
+    payload into clean text before the prompt is rendered.  The script
+    receives the raw body on stdin and its stdout becomes available as
+    {__processed__} in the prompt template.  Exit code 2 = "nothing to do"
+    (skip the agent), 0 = success, 1 = error (falls back to raw payload).
   - prompt: template string formatted with the webhook payload
   - skills: optional list of skills to load for the agent
   - deliver: where to send the response (github_comment, telegram, etc.)
@@ -33,6 +38,7 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import re
 import subprocess
 import time
@@ -484,6 +490,7 @@ class WebhookAdapter(BasePlatformAdapter):
         event_type = (
             request.headers.get("X-GitHub-Event", "")
             or request.headers.get("X-GitLab-Event", "")
+            or request.headers.get("Linear-Event", "")
             or payload.get("event_type", "")
             or payload.get("type", "")
             or "unknown"
@@ -500,10 +507,56 @@ class WebhookAdapter(BasePlatformAdapter):
                 {"status": "ignored", "event": event_type}
             )
 
+        # ── Pre-process hook ──────────────────────────────────
+        # Optional script that transforms the raw payload into a clean,
+        # agent-ready text block before the prompt is rendered.  The
+        # script's stdout becomes available as {__processed__} in the
+        # prompt template.  Exit code 2 means "nothing to do" (e.g. a
+        # non-Issue Linear event) — return 200 and skip the agent.
+        processed_text: Optional[str] = None
+        pre_process = route_config.get("pre_process")
+        if pre_process:
+            try:
+                import shutil as _shutil
+                script_path = _shutil.which(pre_process) or os.path.expanduser(pre_process)
+                proc = await asyncio.create_subprocess_exec(
+                    script_path,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(raw_body), timeout=10
+                )
+                if proc.returncode == 2:
+                    logger.info(
+                        "[webhook] pre_process returned IGNORE (exit 2) "
+                        "for route %s — skipping", route_name
+                    )
+                    return web.json_response(
+                        {"status": "ignored", "route": route_name},
+                        status=200,
+                    )
+                if proc.returncode != 0:
+                    logger.warning(
+                        "[webhook] pre_process failed (exit %d) for route "
+                        "%s: %s", proc.returncode, route_name,
+                        stderr.decode("utf-8", "replace")[:500],
+                    )
+                else:
+                    processed_text = stdout.decode("utf-8", "replace").strip()
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[webhook] pre_process timed out for route %s", route_name
+                )
+            except Exception as e:
+                logger.warning("[webhook] pre_process error: %s", e)
+
         # Format prompt from template
         prompt_template = route_config.get("prompt", "")
         prompt = self._render_prompt(
-            prompt_template, payload, event_type, route_name
+            prompt_template, payload, event_type, route_name,
+            processed_text=processed_text,
         )
 
         # Inject skill content if configured.
@@ -658,6 +711,30 @@ class WebhookAdapter(BasePlatformAdapter):
             delivery_id,
         )
 
+        # ── Per-route model override ───────────────────────────
+        # If the subscription specifies a model/provider, inject it as a
+        # session model override so the agent uses it instead of the global
+        # model.default.  We must use the same key _resolve_session_agent_runtime
+        # will look up — the full session key from _session_key_for_source, not
+        # the raw chat_id.  Since handle_message hasn't resolved the key yet,
+        # we compute it from the source the same way the gateway does.
+        route_model = route_config.get("model")
+        route_provider = route_config.get("provider")
+        if route_model and self.gateway_runner:
+            override = {"model": route_model}
+            if route_provider:
+                override["provider"] = route_provider
+            # Compute the full session key to match what the gateway resolves.
+            try:
+                full_session_key = self.gateway_runner._session_key_for_source(source)
+            except Exception:
+                full_session_key = session_chat_id
+            self.gateway_runner._session_model_overrides[full_session_key] = override
+            logger.info(
+                "[webhook] route=%s model_override=%s provider=%s session=%s",
+                route_name, route_model, route_provider, full_session_key,
+            )
+
         # Non-blocking — return 202 Accepted immediately
         task = asyncio.create_task(self.handle_message(event))
         self._background_tasks.add(task)
@@ -719,6 +796,19 @@ class WebhookAdapter(BasePlatformAdapter):
         if gl_token:
             return hmac.compare_digest(gl_token, secret)
 
+        # Linear: Linear-Signature = <hex HMAC-SHA256>
+        linear_sig = (
+            request.headers.get("Linear-Signature", "")
+            or request.headers.get("X-Linear-Signature", "")
+        )
+        if linear_sig:
+            # Strip "sha256=" prefix if present (GitHub-style)
+            sig_value = linear_sig.removeprefix("sha256=")
+            expected = hmac.new(
+                secret.encode(), body, hashlib.sha256
+            ).hexdigest()
+            return hmac.compare_digest(sig_value, expected)
+
         # Generic: X-Webhook-Signature = <hex HMAC-SHA256>
         generic_sig = request.headers.get("X-Webhook-Signature", "")
         if generic_sig:
@@ -728,8 +818,11 @@ class WebhookAdapter(BasePlatformAdapter):
             return hmac.compare_digest(generic_sig, expected)
 
         # No recognised signature header but secret is configured → reject
-        logger.debug(
-            "[webhook] Secret configured but no signature header found"
+        # Log all headers for debugging
+        all_headers = dict(request.headers)
+        logger.warning(
+            "[webhook] No recognised signature header. All headers: %s",
+            json.dumps(all_headers, default=str),
         )
         return False
 
@@ -793,15 +886,16 @@ class WebhookAdapter(BasePlatformAdapter):
         payload: dict,
         event_type: str,
         route_name: str,
+        processed_text: Optional[str] = None,
     ) -> str:
         """Render a prompt template with the webhook payload.
 
         Supports dot-notation access into nested dicts:
         ``{pull_request.title}`` → ``payload["pull_request"]["title"]``
 
-        Special token ``{__raw__}`` dumps the entire payload as indented
-        JSON (truncated to 4000 chars).  Useful for monitoring alerts or
-        any webhook where the agent needs to see the full payload.
+        Special tokens:
+          ``{__raw__}``       — entire payload as indented JSON (4000 chars)
+          ``{__processed__}``  — output of the ``pre_process`` script, if any
         """
         if not template:
             truncated = json.dumps(payload, indent=2)[:4000]
@@ -815,6 +909,8 @@ class WebhookAdapter(BasePlatformAdapter):
             # Special token: dump the entire payload as JSON
             if key == "__raw__":
                 return json.dumps(payload, indent=2)[:4000]
+            if key == "__processed__":
+                return processed_text or ""
             value: Any = payload
             for part in key.split("."):
                 if isinstance(value, dict):

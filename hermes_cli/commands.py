@@ -530,8 +530,10 @@ _TELEGRAM_MENU_PRIORITY = (
     "help",
     "new",
     "stop",
-    # Novara pipeline: start the next backlog issue from chat.
+    # Novara pipeline: start work, and decide trust-root overrides.
     "pull",
+    "trustroot",
+    "reject",
     "status",
     "resume",
     "sessions",
