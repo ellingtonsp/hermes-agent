@@ -847,6 +847,32 @@ class WebhookAdapter(BasePlatformAdapter):
             override = {"model": route_model}
             if route_provider:
                 override["provider"] = route_provider
+                # A provider label alone does NOT switch the HTTP endpoint:
+                # _apply_session_model_override only swaps base_url/api_key/
+                # api_mode when they are present in the override dict. Without
+                # them the per-delivery session keeps the global-default client
+                # (e.g. ollama.com/v1), so an anthropic model name 404s there
+                # and silently falls back to the default provider's model
+                # (minimax-m3). Resolve the full provider runtime so the
+                # override actually targets the requested provider.
+                try:
+                    from hermes_cli.runtime_provider import (
+                        resolve_runtime_provider,
+                    )
+                    _rt = resolve_runtime_provider(
+                        requested=route_provider, target_model=route_model
+                    )
+                    for _k in ("base_url", "api_key", "api_mode"):
+                        _v = _rt.get(_k)
+                        if _v:
+                            override[_k] = _v
+                except Exception:
+                    logger.warning(
+                        "[webhook] provider runtime resolution failed for "
+                        "route %s provider %s — the override may fall back to "
+                        "the default client",
+                        route_name, route_provider, exc_info=True,
+                    )
             # Compute the full session key to match what the gateway resolves.
             try:
                 full_session_key = self.gateway_runner._session_key_for_source(source)
@@ -854,8 +880,9 @@ class WebhookAdapter(BasePlatformAdapter):
                 full_session_key = session_chat_id
             self.gateway_runner._session_model_overrides[full_session_key] = override
             logger.info(
-                "[webhook] route=%s model_override=%s provider=%s session=%s",
-                route_name, route_model, route_provider, full_session_key,
+                "[webhook] route=%s model_override=%s provider=%s base_url=%s session=%s",
+                route_name, route_model, route_provider,
+                override.get("base_url", "(session default)"), full_session_key,
             )
 
         # Non-blocking — return 202 Accepted immediately.  The per-delivery
