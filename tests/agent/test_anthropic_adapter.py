@@ -29,6 +29,21 @@ from agent.anthropic_adapter import (
 from agent.transports import get_transport
 
 
+@pytest.fixture(autouse=True)
+def _no_real_keychain_writes(monkeypatch):
+    """Keep credential-write tests away from the developer's real Keychain.
+
+    ``_write_claude_code_credentials`` mirrors rotated tokens into the live
+    "Claude Code-credentials" Keychain entry on Darwin; without this guard,
+    tests that exercise the write path would clobber the developer's actual
+    Claude Code login with fixture tokens.
+    """
+    monkeypatch.setattr(
+        "agent.anthropic_adapter._sync_claude_code_credentials_to_keychain",
+        lambda oauth_data: None,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Auth helpers
 # ---------------------------------------------------------------------------

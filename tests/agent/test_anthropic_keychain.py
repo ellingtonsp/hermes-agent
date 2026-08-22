@@ -6,6 +6,7 @@ from unittest.mock import patch, MagicMock
 
 from agent.anthropic_adapter import (
     _read_claude_code_credentials_from_keychain,
+    _sync_claude_code_credentials_to_keychain,
     read_claude_code_credentials,
     _refresh_oauth_token,
 )
@@ -334,4 +335,97 @@ class TestRefreshOAuthTokenAdoptsFreshCredential:
         assert result == "newly-minted"
         # Prefers the live source's refresh token over the caller's stale copy.
         assert captured["refresh_token"] == "live-refresh"
+
+
+class TestSyncClaudeCodeCredentialsToKeychain:
+    """Rotated tokens must be mirrored into the Keychain entry Claude Code
+    actually reads (>=2.1.114 on macOS). Anthropic refresh tokens are
+    single-use, so a file-only write strands the Keychain with a consumed
+    refresh token and forces the user through an interactive re-login.
+    """
+
+    _OAUTH = {
+        "accessToken": "rotated-access",
+        "refreshToken": "rotated-refresh",
+        "expiresAt": 1234567890,
+    }
+
+    @staticmethod
+    def _existing_entry_run(cmd, **kwargs):
+        """Simulate `security` for an entry that already exists."""
+        result = MagicMock(returncode=0, stderr="")
+        if cmd[:2] == ["security", "find-generic-password"]:
+            if "-w" in cmd:
+                result.stdout = json.dumps({
+                    "claudeAiOauth": {
+                        "accessToken": "old-access",
+                        "refreshToken": "old-refresh",
+                        "subscriptionType": "max",
+                    }
+                })
+            else:
+                result.stdout = '    "acct"<blob>="bourbon"\n'
+        else:
+            result.stdout = ""
+        return result
+
+    def test_noop_off_darwin(self):
+        with patch("agent.anthropic_adapter.platform.system", return_value="Linux"), \
+             patch("agent.anthropic_adapter.subprocess.run") as mock_run:
+            _sync_claude_code_credentials_to_keychain(dict(self._OAUTH))
+        mock_run.assert_not_called()
+
+    def test_skips_when_entry_absent(self):
+        """Never create the entry — Claude Code owns its creation and ACL;
+        file-only installs must stay file-only."""
+        with patch("agent.anthropic_adapter.platform.system", return_value="Darwin"), \
+             patch("agent.anthropic_adapter.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="")
+            _sync_claude_code_credentials_to_keychain(dict(self._OAUTH))
+        for call in mock_run.call_args_list:
+            assert call.args[0][:2] != ["security", "-i"]
+            assert "add-generic-password" not in call.args[0]
+
+    def test_updates_existing_entry_preserving_extra_fields(self):
+        with patch("agent.anthropic_adapter.platform.system", return_value="Darwin"), \
+             patch("agent.anthropic_adapter.subprocess.run",
+                   side_effect=self._existing_entry_run) as mock_run:
+            _sync_claude_code_credentials_to_keychain(dict(self._OAUTH))
+
+        write_calls = [c for c in mock_run.call_args_list if c.args[0] == ["security", "-i"]]
+        assert len(write_calls) == 1
+        script = write_calls[0].kwargs["input"]
+        assert "add-generic-password" in script
+        assert "-U" in script
+        # Payload is the merged entry: rotated pair present, Keychain-only
+        # fields (subscriptionType) survive the rotation.
+        assert "rotated-access" in script
+        assert "rotated-refresh" in script
+        assert "old-access" not in script
+        assert '\\"subscriptionType\\":' not in script or "max" in script
+        assert "max" in script
+        # Uses the entry's own account attribute, not a guess.
+        assert '"bourbon"' in script
+
+    def test_token_never_in_argv(self):
+        """The write must go through `security -i` stdin so the token is not
+        visible in the process argument list."""
+        with patch("agent.anthropic_adapter.platform.system", return_value="Darwin"), \
+             patch("agent.anthropic_adapter.subprocess.run",
+                   side_effect=self._existing_entry_run) as mock_run:
+            _sync_claude_code_credentials_to_keychain(dict(self._OAUTH))
+        for call in mock_run.call_args_list:
+            assert "rotated-access" not in " ".join(call.args[0])
+
+    def test_write_failure_is_swallowed(self):
+        """A failed Keychain write must not raise — the file write already
+        succeeded and the adapter degrades to the pre-sync behavior."""
+        def _run(cmd, **kwargs):
+            if cmd == ["security", "-i"]:
+                return MagicMock(returncode=1, stdout="", stderr="denied")
+            return self._existing_entry_run(cmd, **kwargs)
+
+        with patch("agent.anthropic_adapter.platform.system", return_value="Darwin"), \
+             patch("agent.anthropic_adapter.subprocess.run", side_effect=_run):
+            _sync_claude_code_credentials_to_keychain(dict(self._OAUTH))
 

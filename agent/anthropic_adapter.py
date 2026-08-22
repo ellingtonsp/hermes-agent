@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import platform
+import re
 import secrets
 import stat
 import subprocess
@@ -1193,6 +1194,119 @@ def _write_claude_code_credentials(
             raise
     except (OSError, IOError) as e:
         logger.debug("Failed to write refreshed credentials: %s", e)
+
+    kc_oauth: Dict[str, Any] = {
+        "accessToken": access_token,
+        "refreshToken": refresh_token,
+        "expiresAt": expires_at_ms,
+    }
+    if scopes is not None:
+        kc_oauth["scopes"] = scopes
+    _sync_claude_code_credentials_to_keychain(kc_oauth)
+
+
+def _sync_claude_code_credentials_to_keychain(oauth_data: Dict[str, Any]) -> None:
+    """Mirror rotated OAuth credentials into the macOS Keychain entry.
+
+    Claude Code >=2.1.114 on macOS reads and refreshes its credentials from
+    the "Claude Code-credentials" Keychain entry, not the JSON file that
+    ``_write_claude_code_credentials`` updates. Anthropic refresh tokens are
+    single-use, so persisting a rotated pair only to the file strands the
+    Keychain with an already-consumed refresh token: Claude Code's next
+    refresh fails with invalid_grant and forces the user through an
+    interactive re-login.
+
+    Only updates an entry that already exists — the entry is created (and
+    ACL'd) by Claude Code itself; installs that never wrote one use the
+    file-only flow and must stay that way.
+    """
+    if platform.system() != "Darwin":
+        return
+
+    try:
+        read_result = subprocess.run(
+            ["security", "find-generic-password",
+             "-s", "Claude Code-credentials",
+             "-w"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        logger.debug("Keychain sync: security command not available or timed out")
+        return
+    if read_result.returncode != 0:
+        logger.debug("Keychain sync: no 'Claude Code-credentials' entry — skipping")
+        return
+
+    try:
+        existing = json.loads(read_result.stdout.strip() or "{}")
+    except json.JSONDecodeError:
+        existing = {}
+    if not isinstance(existing, dict):
+        existing = {}
+
+    # Merge onto the entry's current claudeAiOauth so Keychain-only fields
+    # (subscriptionType, scopes when the refresh response omitted them, ...)
+    # survive the rotation.
+    merged_oauth = dict(existing.get("claudeAiOauth") or {})
+    merged_oauth.update(oauth_data)
+    existing["claudeAiOauth"] = merged_oauth
+
+    # -U only updates in place when service AND account match, so reuse the
+    # entry's own account attribute rather than guessing from the environment.
+    account = ""
+    try:
+        attr_result = subprocess.run(
+            ["security", "find-generic-password",
+             "-s", "Claude Code-credentials"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            stdin=subprocess.DEVNULL,
+        )
+        match = re.search(r'"acct"<blob>="([^"]*)"', attr_result.stdout)
+        if match:
+            account = match.group(1)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    if not account:
+        account = os.environ.get("USER", "")
+    if not account:
+        logger.debug("Keychain sync: could not determine entry account — skipping")
+        return
+
+    # Feed the command to `security -i` over stdin so the token never
+    # appears in the process argument list (visible to other local users
+    # via ps while the write is in flight).
+    def _kc_quote(value: str) -> str:
+        return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+    script = " ".join([
+        "add-generic-password", "-U",
+        "-a", _kc_quote(account),
+        "-s", _kc_quote("Claude Code-credentials"),
+        "-w", _kc_quote(json.dumps(existing)),
+    ]) + "\n"
+    try:
+        write_result = subprocess.run(
+            ["security", "-i"],
+            input=script,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        logger.debug("Keychain sync: write timed out or security unavailable")
+        return
+    if write_result.returncode != 0:
+        logger.debug(
+            "Keychain sync: add-generic-password failed: %s",
+            (write_result.stderr or "").strip(),
+        )
+    else:
+        logger.debug("Keychain sync: updated 'Claude Code-credentials' entry")
 
 
 def _resolve_claude_code_token_from_credentials(creds: Optional[Dict[str, Any]] = None) -> Optional[str]:
