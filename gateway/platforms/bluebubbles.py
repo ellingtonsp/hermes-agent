@@ -120,6 +120,11 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         path = str(_extra_or_secret(extra, "webhook_path", "BLUEBUBBLES_WEBHOOK_PATH", DEFAULT_WEBHOOK_PATH))
         self.webhook_path = path if path.startswith("/") else f"/{path}"
         self.send_read_receipts = bool(extra.get("send_read_receipts", True))
+        # Send-only contexts (cron auto-delivery, send_message tool) reuse this
+        # adapter for outbound REST sends. A webhook listener must not be bound
+        # there — the live gateway already owns the port (#58621-class clash) —
+        # and its unregister must never touch the server's real registration.
+        self._start_listener = bool(extra.get("webhook_listener", True))
         _require_mention = extra.get("require_mention")
         if _require_mention is None:
             _require_mention = _get_scoped_secret("BLUEBUBBLES_REQUIRE_MENTION")
@@ -213,6 +218,13 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             logger.error("[bluebubbles] cannot reach server at %s: %s", self.server_url, exc)
             await self._close_client()
             return False
+        # Send-only mode: skip the webhook listener entirely. The live gateway
+        # process owns the bind; a second bind here would crash delivery with
+        # EADDRINUSE, and an unregister from this clone would deregister the
+        # real registration the gateway depends on for inbound.
+        if not self._start_listener:
+            self._mark_connected()
+            return True
         # client_max_size makes aiohttp enforce the cap on every read path, incl. chunked requests
         # with no Content-Length.
         # Explicit body cap: BlueBubbles webhook events are small JSON (or form-encoded) payloads.
@@ -242,7 +254,10 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             self.client = None
 
     async def disconnect(self) -> None:
-        await self._unregister_webhook()
+        # Send-only clones never registered anything — leave the live
+        # gateway's webhook registration alone.
+        if self._start_listener:
+            await self._unregister_webhook()
         await self._close_client()
         if self._runner:
             await self._runner.cleanup()
