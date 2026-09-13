@@ -32,6 +32,24 @@ skill installed by `cua-driver skills install`. Hermes autodetection is a
 planned cua-driver follow-up, so currently point Hermes at the resulting
 `~/.cua-driver/skills/cua-driver` directory or symlink it into your skill space.
 
+## Agent-first interaction contract
+
+Routine desktop and browser work is agent-driven. Do not lead with VNC/Screens or ask the human to perform steps the tools can perform. Give one short start message and meaningful blocker/result updates, not a click-by-click narration. Keep control screenshots internal unless needed for a blocker, confirmation, or final result; do not share secret-bearing screens.
+
+Reuse the intended signed-in local work browser. A named automation session or headed window alone is NOT durable profile persistence. Attach through a supported, explicitly authorized existing-profile connection; do not copy cookies, clear storage, restart the personal browser, or silently fall back to anonymous/cloud browsing when login state matters. Use browser DOM tools for page content when attached to the right browser; native controls for native UI.
+
+Approval is not takeover: ask visual questions with a screenshot in chat and keep consequential outbound work draft-only pending explicit authorization. Human-only SSO, password, 2FA, CAPTCHA, payment, first-time consent and OS permission checkpoints require a short reason plus the exact action needed; a phone approval may not need desktop access. Offer watch only on request. Never claim watch is read-only unless enforced.
+
+Pause all input on the controlled desktop during human takeover. Resume only after an explicit return of control in the originating conversation, then capture fresh state and verify the actual result/account. Disconnection and elapsed time are not resume signals. Do not launch concurrent workers against the same desktop. Background input does not by itself make a task asynchronous; use supported tracked background execution for long work and deliver completion to the originating chat.
+
+On failure run available diagnostics yourself, including `hermes computer-use doctor`, and verify a real capture: a healthy read-only report is not proof capture works. Follow the bounded verification/escalation ladder, never repeat confirmed input, and report a precise blocker after exhausted recovery instead of dumping a remote link. No monitoring cron is needed for routine operation.
+
+## Optional Telegram handoff card
+
+For a real human-only checkpoint or an explicit handoff test, first stop desktop input and save the task/checkpoint in a local runtime file. Run this skill's `scripts/telegram_handoff.py` with `--chat-id`, `--url` (the configured tailnet HTTPS launcher), `--reason` (precise non-secret instruction), and `--task` (short ID). Add `--thread-id` only for the originating Telegram topic. Use `--dry-run` to inspect the payload. It reads only the active profile's Telegram credential and sends one labeled URL button, no raw transport URL in the message text.
+
+This helper does NOT own the desktop, poll Telegram, register callbacks, or automatically resume. The agent must pause input BEFORE sending. The same authorized user returns control through normal chat with `resume <task>`. On that message, read the saved checkpoint, re-capture the target app, verify the result and continue. A send timeout is uncertain delivery; do not blindly duplicate the request. Cross-profile mutual exclusion remains a coordination rule, not a hardware lock. Never claim callbacks or global enforcement exist.
+
 ## The canonical workflow
 
 **Step 1 — Capture first.** Almost every task starts with:
