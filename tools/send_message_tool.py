@@ -2330,7 +2330,11 @@ async def _send_bluebubbles(extra, chat_id, message):
 
     try:
         from gateway.config import PlatformConfig
-        pconfig = PlatformConfig(extra=extra)
+        # Clone for outbound sends only: never bind a webhook listener (the
+        # live gateway owns that port) and never unregister its registration.
+        send_extra = dict(extra or {})
+        send_extra["webhook_listener"] = False
+        pconfig = PlatformConfig(extra=send_extra)
         adapter = BlueBubblesAdapter(pconfig)
         connected = await adapter.connect()
         if not connected:
