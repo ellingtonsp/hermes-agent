@@ -5251,30 +5251,14 @@ def _pool_codex_access_token() -> str:
     the original AuthError).
     """
     try:
-        with _auth_store_lock():
-            auth_store = _load_auth_store()
-        pool = auth_store.get("credential_pool")
-        if not isinstance(pool, dict):
-            return ""
-        entries = pool.get("openai-codex")
-        if not isinstance(entries, list):
-            return ""
+        # Share inference's profile-aware selection and locked refresh path.
+        # A raw profile auth.json read misses grants borrowed from the root,
+        # and returning raw tokens also bypasses expiry/dead-state handling.
+        from agent.credential_pool import load_pool
 
-        def _entry_usable(entry: Dict[str, Any]) -> bool:
-            if not isinstance(entry, dict):
-                return False
-            token = entry.get("access_token")
-            if not isinstance(token, str) or not token.strip():
-                return False
-            # Skip entries currently in an exhaustion cooldown window.
-            reset_at = entry.get("last_error_reset_at")
-            if isinstance(reset_at, (int, float)) and reset_at > time.time():
-                return False
-            return True
-
-        for entry in entries:
-            if _entry_usable(entry):
-                return str(entry.get("access_token", "")).strip()
+        entry = load_pool("openai-codex").select()
+        if entry is not None:
+            return str(entry.access_token or "").strip()
     except Exception:
         logger.debug("Codex pool fallback lookup failed", exc_info=True)
     return ""

@@ -4505,10 +4505,14 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
         # or the endpoint is unreachable.
         access_token = None
         try:
-            from hermes_cli.auth import resolve_codex_runtime_credentials
+            # Use the same profile-aware pool as inference. The legacy
+            # singleton resolver misses credentials borrowed from the root
+            # store and silently hides live-only models in profile pickers.
+            # Pool selection also coordinates single-use OAuth refreshes.
+            from agent.credential_pool import load_pool
 
-            creds = resolve_codex_runtime_credentials(refresh_if_expiring=True)
-            access_token = creds.get("api_key")
+            entry = load_pool("openai-codex").select()
+            access_token = entry.access_token if entry is not None else None
         except Exception:
             access_token = None
         return get_codex_model_ids(access_token=access_token)
