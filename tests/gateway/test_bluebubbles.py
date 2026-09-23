@@ -606,3 +606,70 @@ class TestBlueBubblesGateBeforeDownload:
         assert response.status == 200
         assert download.await_count == downloads
         assert len(handled) == handled_count
+
+
+class TestBlueBubblesSendOnlyMode:
+    """Outbound-only clones (send_message tool, cron delivery) must never bind
+    the webhook port or touch the live gateway's webhook registration."""
+
+    @pytest.mark.asyncio
+    async def test_send_only_connect_skips_listener_and_registration(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch, webhook_listener=False)
+        adapter._api_get = AsyncMock(return_value={"data": {}})
+        adapter._register_webhook = AsyncMock()
+        bind = AsyncMock()
+        monkeypatch.setattr("gateway.platforms.shared_ingress.bind_listener", bind)
+
+        assert await adapter.connect() is True
+
+        bind.assert_not_awaited()
+        adapter._register_webhook.assert_not_awaited()
+        assert adapter._runner is None
+
+    @pytest.mark.asyncio
+    async def test_send_only_disconnect_leaves_registration_alone(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch, webhook_listener=False)
+        adapter._unregister_webhook = AsyncMock()
+
+        await adapter.disconnect()
+
+        adapter._unregister_webhook.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_default_disconnect_still_unregisters(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter._unregister_webhook = AsyncMock()
+
+        await adapter.disconnect()
+
+        adapter._unregister_webhook.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_send_message_sender_uses_send_only_clone(self, monkeypatch):
+        import gateway.platforms.bluebubbles as bb
+        from tools import send_message_senders
+
+        seen = {}
+
+        class FakeAdapter:
+            def __init__(self, cfg):
+                seen["extra"] = dict(cfg.extra)
+
+            async def connect(self):
+                return True
+
+            async def send(self, chat_id, message):
+                from types import SimpleNamespace
+                return SimpleNamespace(success=True, message_id="m1", error=None)
+
+            async def disconnect(self):
+                pass
+
+        monkeypatch.setattr(bb, "BlueBubblesAdapter", FakeAdapter)
+        monkeypatch.setattr(send_message_senders, "_gateway_platform_module", lambda *a, **k: (bb, None))
+        extra = {"server_url": "http://localhost:1234", "password": "secret"}
+
+        await send_message_senders._send_bluebubbles(extra, "chat", "hi")
+
+        assert seen["extra"]["webhook_listener"] is False
+        assert "webhook_listener" not in extra  # caller's config is not mutated
